@@ -139,7 +139,6 @@ class MainActivity : AppCompatActivity() {
                 
                 var bestModel = "gemini-1.5-flash"
                 
-                // Prioritize finding 1.5 Flash first for audio STT speed
                 for (i in 0 until models.length()) {
                     val name = models.getJSONObject(i).getString("name")
                     if (name.contains("gemini-1.5-flash")) {
@@ -147,7 +146,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 
-                // Fallback to 1.5 Pro if Flash isn't available
                 for (i in 0 until models.length()) {
                     val name = models.getJSONObject(i).getString("name")
                     if (name.contains("gemini-1.5-pro")) {
@@ -192,155 +190,6 @@ class MainActivity : AppCompatActivity() {
             if (!response.isSuccessful) return "API Error (${response.code}): ${response.body?.string()}"
             val resObj = JSONObject(response.body?.string() ?: "")
             val candidates = resObj.optJSONArray("candidates") ?: return "No response generated."
-            val content = candidates.getJSONObject(0).getJSONObject("content")
-            val parts = content.getJSONArray("parts")
-            return parts.getJSONObject(0).getString("text")
-        }
-    }
-}
-updateModelSpinner(validModels) }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-    }
-
-    private fun updateModelSpinner(models: List<String>) {
-        if (models.isEmpty()) return
-        
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
-        modelSpinner.adapter = adapter
-        
-        modelSpinner.post {
-            (modelSpinner.selectedView as? TextView)?.setTextColor(Color.WHITE)
-        }
-
-        val savedModel = getSavedModel()
-        val position = models.indexOf(savedModel)
-        if (position >= 0) modelSpinner.setSelection(position)
-
-        modelSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
-                (view as? TextView)?.setTextColor(Color.WHITE)
-                saveSelectedModel(models[pos])
-                closeSettingsButton.visibility = View.VISIBLE
-            }
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
-        }
-    }
-
-    private fun handleIncomingAudio(intent: Intent) {
-        val audioUri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: return
-        
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                withContext(Dispatchers.Main) {
-                    statusTextView.text = "Extracting audio file..."
-                    rerunButton.visibility = View.GONE
-                }
-                
-                val inputStream: InputStream? = contentResolver.openInputStream(audioUri)
-                val bytes = inputStream?.readBytes() ?: throw Exception("Failed to read audio bytes.")
-                lastBase64Audio = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                
-                runSTTFlow(lastBase64Audio!!)
-                
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) { statusTextView.text = "Extraction Error: ${e.localizedMessage}" }
-            }
-        }
-    }
-    
-    private fun runSTTFlow(base64Audio: String) {
-        val apiKey = getSavedApiKey()
-        val selectedModel = getSavedModel()
-        
-        if (apiKey.isEmpty() || selectedModel.isEmpty()) {
-            CoroutineScope(Dispatchers.Main).launch {
-                statusTextView.text = "Error: Settings incomplete."
-            }
-            return
-        }
-
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                withContext(Dispatchers.Main) {
-                    statusTextView.text = "Transcribing with $selectedModel...\nThis may take a few seconds."
-                    rerunButton.visibility = View.GONE
-                }
-
-                val transcript = executeWithRetry(base64Audio, apiKey, selectedModel)
-
-                withContext(Dispatchers.Main) { 
-                    statusTextView.text = transcript
-                    rerunButton.visibility = View.VISIBLE
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) { 
-                    statusTextView.text = "Error: ${e.localizedMessage}"
-                    rerunButton.visibility = View.VISIBLE
-                }
-            }
-        }
-    }
-
-    private suspend fun executeWithRetry(base64Audio: String, apiKey: String, modelName: String): String {
-        var currentAttempt = 1
-        val maxAttempts = 3
-        var waitTimeMs = 2000L
-
-        while (true) {
-            val result = requestGeminiTranscription(base64Audio, apiKey, modelName)
-            
-            val isRateLimited = result.startsWith("API Error (429)")
-            val isServerError = result.startsWith("API Error (500)") || result.startsWith("API Error (503)")
-            
-            if (isRateLimited || isServerError) {
-                if (currentAttempt >= maxAttempts) return "Failed after $maxAttempts attempts.\n\nLatest Error: $result"
-                
-                withContext(Dispatchers.Main) {
-                    statusTextView.text = "Model busy. Retrying in ${waitTimeMs/1000}s...\n(Attempt $currentAttempt of $maxAttempts)\n\n$result"
-                }
-                delay(waitTimeMs)
-                waitTimeMs *= 2 // Exponential backoff
-                currentAttempt++
-            } else {
-                return result
-            }
-        }
-    }
-
-    private fun requestGeminiTranscription(base64Audio: String, apiKey: String, modelName: String): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/$modelName:generateContent?key=$apiKey"
-
-        val jsonBody = JSONObject().apply {
-            put("contents", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("parts", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("text", "Detect the spoken language, provide a full verbatim transcript in the original language, and then provide an English translation.")
-                        })
-                        put(JSONObject().apply {
-                            put("inline_data", JSONObject().apply {
-                                put("mime_type", "audio/ogg")
-                                put("data", base64Audio)
-                            })
-                        })
-                    })
-                })
-            })
-        }
-
-        val request = Request.Builder()
-            .url(url)
-            .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return "API Error (${response.code}): ${response.body?.string()}"
-            val resObj = JSONObject(response.body?.string() ?: "")
-            val candidates = resObj.optJSONArray("candidates") ?: return "No response generated. (Ensure the selected model supports audio input)."
             val content = candidates.getJSONObject(0).getJSONObject("content")
             val parts = content.getJSONArray("parts")
             return parts.getJSONObject(0).getString("text")
