@@ -2,18 +2,18 @@ package com.example.geministt
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-import android.widget.Toast
+import android.view.View
+import android.view.ViewGroup
+import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -27,8 +27,18 @@ import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
 
+    private lateinit var rootLayout: FrameLayout
+    private lateinit var settingsLayout: LinearLayout
+    private lateinit var mainLayout: LinearLayout
+
     private lateinit var statusTextView: TextView
     private lateinit var apiKeyInput: EditText
+    private lateinit var modelSpinner: Spinner
+    private lateinit var closeSettingsButton: Button
+    private lateinit var rerunButton: Button
+
+    private var lastBase64Audio: String? = null
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
@@ -36,132 +46,363 @@ class MainActivity : AppCompatActivity() {
 
     private val PREFS_NAME = "GeminiPrefs"
     private val KEY_API = "apiKey"
+    private val KEY_MODEL = "selectedModel"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
+        rootLayout = FrameLayout(this)
+        
+        buildSettingsView()
+        buildMainSTTView()
+        
+        rootLayout.addView(mainLayout)
+        rootLayout.addView(settingsLayout)
+        setContentView(rootLayout)
 
-        val layout = LinearLayout(this).apply {
+        val savedKey = getSavedApiKey()
+        if (savedKey.isEmpty()) {
+            showSettings()
+        } else {
+            showMain()
+            fetchAvailableModels(savedKey)
+        }
+
+        if (intent?.action == Intent.ACTION_SEND) {
+            if (savedKey.isEmpty()) {
+                showSettings()
+                Toast.makeText(this, "Please set up your API Key first", Toast.LENGTH_LONG).show()
+            } else {
+                showMain()
+                handleIncomingAudio(intent)
+            }
+        }
+    }
+
+    private fun buildSettingsView() {
+        settingsLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(48, 48, 48, 48)
+            setPadding(64, 80, 64, 64)
+            setBackgroundColor(Color.parseColor("#121212"))
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
+        val title = TextView(this).apply {
+            text = "Welcome to Gemini STT"
+            textSize = 24f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            setPadding(0, 0, 0, 16)
+        }
+
+        val description = TextView(this).apply {
+            text = "Transcribe WhatsApp voice notes in any language. To get started, you need a free Gemini API key."
+            textSize = 14f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, 0, 0, 48)
+        }
+
+        val getLinkButton = Button(this).apply {
+            text = "Get Free API Key"
+            setBackgroundColor(Color.parseColor("#1A73E8"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                val url = "https://aistudio.google.com/app/apikey"
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            }
         }
 
         apiKeyInput = EditText(this).apply {
-            hint = "Paste Gemini API Key here"
+            hint = "Paste API Key Here"
+            setHintTextColor(Color.DKGRAY)
+            setTextColor(Color.WHITE)
             setText(getSavedApiKey())
+            setPadding(0, 48, 0, 48)
         }
 
-        val saveButton = Button(this).apply {
-            text = "Save Key"
+        modelSpinner = Spinner(this).apply {
+            setPadding(0, 24, 0, 48)
+        }
+
+        val fetchModelsButton = Button(this).apply {
+            text = "Verify Key & Load Models"
             setOnClickListener {
-                saveApiKey(apiKeyInput.text.toString().trim())
-                Toast.makeText(this@MainActivity, "API Key Saved", Toast.LENGTH_SHORT).show()
+                val key = apiKeyInput.text.toString().trim()
+                if (key.isNotEmpty()) {
+                    saveApiKey(key)
+                    Toast.makeText(this@MainActivity, "Fetching models...", Toast.LENGTH_SHORT).show()
+                    fetchAvailableModels(key)
+                }
             }
+        }
+
+        closeSettingsButton = Button(this).apply {
+            text = "Save & Continue"
+            visibility = View.GONE
+            setOnClickListener { showMain() }
+        }
+
+        settingsLayout.addView(title)
+        settingsLayout.addView(description)
+        settingsLayout.addView(getLinkButton)
+        settingsLayout.addView(apiKeyInput)
+        settingsLayout.addView(fetchModelsButton)
+        
+        val modelLabel = TextView(this).apply { 
+            text = "Select Audio Model:"
+            setTextColor(Color.LTGRAY)
+            setPadding(0, 48, 0, 8)
+        }
+        settingsLayout.addView(modelLabel)
+        settingsLayout.addView(modelSpinner)
+        settingsLayout.addView(closeSettingsButton)
+    }
+
+    private fun buildMainSTTView() {
+        mainLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#121212"))
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(48, 48, 48, 48)
+            setBackgroundColor(Color.parseColor("#1F1F1F"))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+
+        val appTitle = TextView(this).apply {
+            text = "Gemini STT"
+            textSize = 20f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val settingsIcon = Button(this).apply {
+            text = "⚙️ Settings"
+            setBackgroundColor(Color.TRANSPARENT)
+            setTextColor(Color.LTGRAY)
+            setPadding(0,0,0,0)
+            setOnClickListener { showSettings() }
+        }
+
+        topBar.addView(appTitle)
+        topBar.addView(settingsIcon)
+
+        val scrollArea = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            setPadding(48, 48, 48, 48)
+        }
+        
+        val contentLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
 
         statusTextView = TextView(this).apply {
             textSize = 16f
-            setPadding(0, 48, 0, 0)
-            text = "Ready. Set your key above, then share an audio file from WhatsApp."
+            setTextColor(Color.parseColor("#E0E0E0"))
+            text = "Ready.\n\nShare an audio file from WhatsApp to transcribe it."
+            setLineSpacing(0f, 1.3f)
+            setPadding(0, 0, 0, 64)
+        }
+        
+        rerunButton = Button(this).apply {
+            text = "Rerun Transcription"
+            setBackgroundColor(Color.parseColor("#333333"))
+            setTextColor(Color.WHITE)
+            visibility = View.GONE
+            setOnClickListener {
+                lastBase64Audio?.let { audio -> runSTTFlow(audio) }
+            }
         }
 
-        layout.addView(apiKeyInput)
-        layout.addView(saveButton)
-        layout.addView(statusTextView)
+        contentLayout.addView(statusTextView)
+        contentLayout.addView(rerunButton)
+        scrollArea.addView(contentLayout)
 
-        val scrollView = ScrollView(this).apply { addView(layout) }
-        setContentView(scrollView)
+        mainLayout.addView(topBar)
+        mainLayout.addView(scrollArea)
+    }
 
-        if (intent?.action == Intent.ACTION_SEND) {
-            handleIncomingAudio(intent)
+    private fun showSettings() {
+        settingsLayout.visibility = View.VISIBLE
+        mainLayout.visibility = View.GONE
+        if (getSavedModel().isNotEmpty()) {
+            closeSettingsButton.visibility = View.VISIBLE
         }
     }
 
-    private fun getSavedApiKey(): String {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getString(KEY_API, "") ?: ""
+    private fun showMain() {
+        settingsLayout.visibility = View.GONE
+        mainLayout.visibility = View.VISIBLE
     }
 
-    private fun saveApiKey(key: String) {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(KEY_API, key).apply()
+    private fun getSavedApiKey(): String = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_API, "") ?: ""
+    private fun saveApiKey(key: String) = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putString(KEY_API, key).apply()
+    
+    private fun getSavedModel(): String = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_MODEL, "") ?: ""
+    private fun saveSelectedModel(model: String) = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putString(KEY_MODEL, model).apply()
+
+    private fun fetchAvailableModels(apiKey: String) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey"
+            val request = Request.Builder().url(url).get().build()
+
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use
+                    
+                    val resObj = JSONObject(response.body?.string() ?: "")
+                    val modelsArray = resObj.optJSONArray("models") ?: return@use
+                    val validModels = mutableListOf<String>()
+
+                    for (i in 0 until modelsArray.length()) {
+                        val name = modelsArray.getJSONObject(i).getString("name").replace("models/", "")
+                        if (name.contains("gemini") && !name.contains("vision") && !name.contains("embedding")) {
+                            validModels.add(name)
+                        }
+                    }
+                    withContext(Dispatchers.Main) { updateModelSpinner(validModels) }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    private fun updateModelSpinner(models: List<String>) {
+        if (models.isEmpty()) return
+        
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
+        modelSpinner.adapter = adapter
+        
+        modelSpinner.post {
+            (modelSpinner.selectedView as? TextView)?.setTextColor(Color.WHITE)
+        }
+
+        val savedModel = getSavedModel()
+        val position = models.indexOf(savedModel)
+        
+        if (position >= 0) {
+            modelSpinner.setSelection(position)
+        } else if (models.isNotEmpty()) {
+            val defaultModel = models.lastOrNull { it.contains("flash") } ?: models.first()
+            modelSpinner.setSelection(models.indexOf(defaultModel))
+            saveSelectedModel(defaultModel)
+        }
+
+        modelSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                (view as? TextView)?.setTextColor(Color.WHITE)
+                saveSelectedModel(models[pos])
+                closeSettingsButton.visibility = View.VISIBLE
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
     }
 
     private fun handleIncomingAudio(intent: Intent) {
         val audioUri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: return
-        val apiKey = getSavedApiKey()
         
-        if (apiKey.isEmpty()) {
-            statusTextView.text = "Error: Please open the app directly and save your API key first."
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Extracting audio file..."
+                    rerunButton.visibility = View.GONE
+                }
+                
+                val inputStream: InputStream? = contentResolver.openInputStream(audioUri)
+                val bytes = inputStream?.readBytes() ?: throw Exception("Failed to read audio bytes.")
+                lastBase64Audio = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                
+                runSTTFlow(lastBase64Audio!!)
+                
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { statusTextView.text = "Extraction Error: ${e.localizedMessage}" }
+            }
+        }
+    }
+    
+    private fun runSTTFlow(base64Audio: String) {
+        val apiKey = getSavedApiKey()
+        val selectedModel = getSavedModel()
+        
+        if (apiKey.isEmpty() || selectedModel.isEmpty()) {
+            CoroutineScope(Dispatchers.Main).launch {
+                statusTextView.text = "Error: Settings incomplete."
+            }
             return
         }
 
-        statusTextView.text = "Reading audio file..."
-
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val inputStream: InputStream? = contentResolver.openInputStream(audioUri)
-                val bytes = inputStream?.readBytes() ?: throw Exception("Failed to read audio bytes.")
-                val base64Audio = Base64.encodeToString(bytes, Base64.NO_WRAP)
-
                 withContext(Dispatchers.Main) {
-                    statusTextView.text = "Locating best available model..."
+                    statusTextView.text = "Transcribing with $selectedModel...\nThis may take a few seconds."
+                    rerunButton.visibility = View.GONE
                 }
 
-                val modelName = getBestAvailableModel(apiKey)
+                val transcript = executeWithRetry(base64Audio, apiKey, selectedModel)
 
-                withContext(Dispatchers.Main) {
-                    statusTextView.text = "Using $modelName...\nTranscribing audio..."
-                }
-
-                val transcript = requestGeminiTranscription(base64Audio, apiKey, modelName)
-
-                withContext(Dispatchers.Main) {
+                withContext(Dispatchers.Main) { 
                     statusTextView.text = transcript
+                    rerunButton.visibility = View.VISIBLE
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
+                withContext(Dispatchers.Main) { 
                     statusTextView.text = "Error: ${e.localizedMessage}"
+                    rerunButton.visibility = View.VISIBLE
                 }
             }
         }
     }
 
-    private fun getBestAvailableModel(apiKey: String): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey"
-        val request = Request.Builder().url(url).get().build()
-        
-        return try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return "gemini-1.5-flash"
-                
-                val resObj = JSONObject(response.body?.string() ?: "")
-                val models = resObj.optJSONArray("models") ?: return "gemini-1.5-flash"
-                
-                var bestModel = "gemini-1.5-flash"
-                
-                for (i in 0 until models.length()) {
-                    val name = models.getJSONObject(i).getString("name")
-                    if (name.contains("gemini-1.5-flash")) {
-                        return name.replace("models/", "")
-                    }
+    private suspend fun executeWithRetry(base64Audio: String, apiKey: String, initialModel: String): String {
+        var currentAttempt = 1
+        val maxAttempts = 3
+        var waitTimeMs = 2000L
+        var currentModel = initialModel
+
+        while (true) {
+            val result = requestGeminiTranscription(base64Audio, apiKey, currentModel)
+            
+            val isRateLimited = result.startsWith("API Error (429)")
+            val isServerError = result.startsWith("API Error (500)") || result.startsWith("API Error (503)")
+            val isOutdated = result.startsWith("API Error (404)") || result.startsWith("API Error (400)")
+
+            if (isOutdated && currentModel != "gemini-1.5-flash") {
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Model $currentModel is outdated.\nAuto-switching to gemini-1.5-flash..."
                 }
                 
-                for (i in 0 until models.length()) {
-                    val name = models.getJSONObject(i).getString("name")
-                    if (name.contains("gemini-1.5-pro")) {
-                        return name.replace("models/", "")
-                    }
+                currentModel = "gemini-1.5-flash"
+                saveSelectedModel(currentModel)
+                
+                withContext(Dispatchers.Main) {
+                    fetchAvailableModels(apiKey) 
                 }
                 
-                bestModel
+                continue 
             }
-        } catch (e: Exception) {
-            "gemini-1.5-flash"
+
+            if (isRateLimited || isServerError) {
+                if (currentAttempt >= maxAttempts) return "Failed after $maxAttempts attempts.\n\nLatest Error: $result"
+                
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Model busy. Retrying in ${waitTimeMs/1000}s...\n(Attempt $currentAttempt of $maxAttempts)\n\n$result"
+                }
+                delay(waitTimeMs)
+                waitTimeMs *= 2 
+                currentAttempt++
+            } else {
+                return result
+            }
         }
     }
 
-    private fun requestGeminiTranscription(base64Audio: String, apiKey: String, model: String): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+    private fun requestGeminiTranscription(base64Audio: String, apiKey: String, modelName: String): String {
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
 
         val jsonBody = JSONObject().apply {
             put("contents", JSONArray().apply {
@@ -189,7 +430,7 @@ class MainActivity : AppCompatActivity() {
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return "API Error (${response.code}): ${response.body?.string()}"
             val resObj = JSONObject(response.body?.string() ?: "")
-            val candidates = resObj.optJSONArray("candidates") ?: return "No response generated."
+            val candidates = resObj.optJSONArray("candidates") ?: return "No response generated. (Ensure the selected model supports audio input)."
             val content = candidates.getJSONObject(0).getJSONObject("content")
             val parts = content.getJSONArray("parts")
             return parts.getJSONObject(0).getString("text")
