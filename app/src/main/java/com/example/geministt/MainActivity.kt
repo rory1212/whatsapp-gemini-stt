@@ -1,11 +1,16 @@
 package com.example.geministt
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,25 +27,48 @@ import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var textView: TextView
+    private lateinit var statusTextView: TextView
+    private lateinit var apiKeyInput: EditText
     private val client = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    // Replace with your Gemini API Key
-    private val geminiApiKey = "YOUR_GEMINI_API_KEY"
+    private val PREFS_NAME = "GeminiPrefs"
+    private val KEY_API = "apiKey"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val scrollView = ScrollView(this)
-        textView = TextView(this).apply {
-            textSize = 16f
-            setPadding(32, 32, 32, 32)
-            text = "Ready. Share an audio file from WhatsApp to transcribe."
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 48, 48, 48)
         }
-        scrollView.addView(textView)
+
+        apiKeyInput = EditText(this).apply {
+            hint = "Paste Gemini API Key here"
+            setText(getSavedApiKey())
+        }
+
+        val saveButton = Button(this).apply {
+            text = "Save Key"
+            setOnClickListener {
+                saveApiKey(apiKeyInput.text.toString().trim())
+                Toast.makeText(this@MainActivity, "API Key Saved", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        statusTextView = TextView(this).apply {
+            textSize = 16f
+            setPadding(0, 48, 0, 0)
+            text = "Ready. Set your key above, then share an audio file from WhatsApp."
+        }
+
+        layout.addView(apiKeyInput)
+        layout.addView(saveButton)
+        layout.addView(statusTextView)
+
+        val scrollView = ScrollView(this).apply { addView(layout) }
         setContentView(scrollView)
 
         if (intent?.action == Intent.ACTION_SEND) {
@@ -48,9 +76,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun getSavedApiKey(): String {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getString(KEY_API, "") ?: ""
+    }
+
+    private fun saveApiKey(key: String) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(KEY_API, key).apply()
+    }
+
     private fun handleIncomingAudio(intent: Intent) {
         val audioUri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: return
-        textView.text = "Reading audio file..."
+        val apiKey = getSavedApiKey()
+        
+        if (apiKey.isEmpty()) {
+            statusTextView.text = "Error: Please open the app directly and save your API key first."
+            return
+        }
+
+        statusTextView.text = "Reading audio file..."
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -59,24 +104,24 @@ class MainActivity : AppCompatActivity() {
                 val base64Audio = Base64.encodeToString(bytes, Base64.NO_WRAP)
 
                 withContext(Dispatchers.Main) {
-                    textView.text = "Transcribing with Gemini..."
+                    statusTextView.text = "Transcribing with Gemini..."
                 }
 
-                val transcript = requestGeminiTranscription(base64Audio)
+                val transcript = requestGeminiTranscription(base64Audio, apiKey)
 
                 withContext(Dispatchers.Main) {
-                    textView.text = transcript
+                    statusTextView.text = transcript
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    textView.text = "Error: ${e.localizedMessage}"
+                    statusTextView.text = "Error: ${e.localizedMessage}"
                 }
             }
         }
     }
 
-    private fun requestGeminiTranscription(base64Audio: String): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$geminiApiKey"
+    private fun requestGeminiTranscription(base64Audio: String, apiKey: String): String {
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$apiKey"
 
         val jsonBody = JSONObject().apply {
             put("contents", JSONArray().apply {
