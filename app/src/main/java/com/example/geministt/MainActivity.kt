@@ -7,13 +7,13 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -35,6 +35,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var apiKeyInput: EditText
     private lateinit var modelSpinner: Spinner
     private lateinit var closeSettingsButton: Button
+    private lateinit var rerunButton: Button
+
+    private var lastBase64Audio: String? = null
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
@@ -48,7 +51,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Root container
         rootLayout = FrameLayout(this)
         
         buildSettingsView()
@@ -63,7 +65,7 @@ class MainActivity : AppCompatActivity() {
             showSettings()
         } else {
             showMain()
-            fetchAvailableModels(savedKey) // Refresh models silently
+            fetchAvailableModels(savedKey)
         }
 
         if (intent?.action == Intent.ACTION_SEND) {
@@ -81,7 +83,7 @@ class MainActivity : AppCompatActivity() {
         settingsLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(64, 80, 64, 64)
-            setBackgroundColor(Color.parseColor("#121212")) // Dark theme background
+            setBackgroundColor(Color.parseColor("#121212"))
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
@@ -163,7 +165,6 @@ class MainActivity : AppCompatActivity() {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
-        // Top Navigation Bar
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(48, 48, 48, 48)
@@ -190,10 +191,13 @@ class MainActivity : AppCompatActivity() {
         topBar.addView(appTitle)
         topBar.addView(settingsIcon)
 
-        // Transcription Area
         val scrollArea = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
             setPadding(48, 48, 48, 48)
+        }
+        
+        val contentLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
 
         statusTextView = TextView(this).apply {
@@ -201,9 +205,22 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#E0E0E0"))
             text = "Ready.\n\nShare an audio file from WhatsApp to transcribe it."
             setLineSpacing(0f, 1.3f)
+            setPadding(0, 0, 0, 64)
+        }
+        
+        rerunButton = Button(this).apply {
+            text = "Rerun Transcription"
+            setBackgroundColor(Color.parseColor("#333333"))
+            setTextColor(Color.WHITE)
+            visibility = View.GONE
+            setOnClickListener {
+                lastBase64Audio?.let { audio -> runSTTFlow(audio) }
+            }
         }
 
-        scrollArea.addView(statusTextView)
+        contentLayout.addView(statusTextView)
+        contentLayout.addView(rerunButton)
+        scrollArea.addView(contentLayout)
 
         mainLayout.addView(topBar)
         mainLayout.addView(scrollArea)
@@ -267,7 +284,6 @@ class MainActivity : AppCompatActivity() {
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
         modelSpinner.adapter = adapter
         
-        // Keep text white in the spinner
         modelSpinner.post {
             (modelSpinner.selectedView as? TextView)?.setTextColor(Color.WHITE)
         }
@@ -288,29 +304,81 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleIncomingAudio(intent: Intent) {
         val audioUri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: return
+        
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Extracting audio file..."
+                    rerunButton.visibility = View.GONE
+                }
+                
+                val inputStream: InputStream? = contentResolver.openInputStream(audioUri)
+                val bytes = inputStream?.readBytes() ?: throw Exception("Failed to read audio bytes.")
+                lastBase64Audio = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                
+                runSTTFlow(lastBase64Audio!!)
+                
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { statusTextView.text = "Extraction Error: ${e.localizedMessage}" }
+            }
+        }
+    }
+    
+    private fun runSTTFlow(base64Audio: String) {
         val apiKey = getSavedApiKey()
         val selectedModel = getSavedModel()
         
         if (apiKey.isEmpty() || selectedModel.isEmpty()) {
-            statusTextView.text = "Error: Settings incomplete."
+            CoroutineScope(Dispatchers.Main).launch {
+                statusTextView.text = "Error: Settings incomplete."
+            }
             return
         }
 
-        statusTextView.text = "Reading audio file..."
-
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val inputStream: InputStream? = contentResolver.openInputStream(audioUri)
-                val bytes = inputStream?.readBytes() ?: throw Exception("Failed to read audio bytes.")
-                val base64Audio = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Transcribing with $selectedModel...\nThis may take a few seconds."
+                    rerunButton.visibility = View.GONE
+                }
 
-                withContext(Dispatchers.Main) { statusTextView.text = "Transcribing with $selectedModel...\nThis may take a few seconds." }
+                val transcript = executeWithRetry(base64Audio, apiKey, selectedModel)
 
-                val transcript = requestGeminiTranscription(base64Audio, apiKey, selectedModel)
-
-                withContext(Dispatchers.Main) { statusTextView.text = transcript }
+                withContext(Dispatchers.Main) { 
+                    statusTextView.text = transcript
+                    rerunButton.visibility = View.VISIBLE
+                }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { statusTextView.text = "Error: ${e.localizedMessage}" }
+                withContext(Dispatchers.Main) { 
+                    statusTextView.text = "Error: ${e.localizedMessage}"
+                    rerunButton.visibility = View.VISIBLE
+                }
+            }
+        }
+    }
+
+    private suspend fun executeWithRetry(base64Audio: String, apiKey: String, modelName: String): String {
+        var currentAttempt = 1
+        val maxAttempts = 3
+        var waitTimeMs = 2000L
+
+        while (true) {
+            val result = requestGeminiTranscription(base64Audio, apiKey, modelName)
+            
+            val isRateLimited = result.startsWith("API Error (429)")
+            val isServerError = result.startsWith("API Error (500)") || result.startsWith("API Error (503)")
+            
+            if (isRateLimited || isServerError) {
+                if (currentAttempt >= maxAttempts) return "Failed after $maxAttempts attempts.\n\nLatest Error: $result"
+                
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Model busy. Retrying in ${waitTimeMs/1000}s...\n(Attempt $currentAttempt of $maxAttempts)\n\n$result"
+                }
+                delay(waitTimeMs)
+                waitTimeMs *= 2 // Exponential backoff
+                currentAttempt++
+            } else {
+                return result
             }
         }
     }
